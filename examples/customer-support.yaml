@@ -1,0 +1,82 @@
+apiVersion: goagents.dev/v1
+kind: AgentCluster
+metadata:
+  name: customer-support
+  namespace: default
+  labels:
+    team: customer-success
+    environment: production
+spec:
+  resource_policy:
+    max_concurrent_agents: 5
+    idle_timeout: 300s
+    scale_to_zero: true
+  agents:
+    - name: intent-classifier
+      provider: anthropic
+      model: claude-sonnet-4
+      system_prompt: |
+        You are an expert customer intent classifier. Analyze customer messages and categorize them into these intents:
+        - BILLING_INQUIRY: Questions about billing, payments, or invoices
+        - TECHNICAL_SUPPORT: Technical issues, bugs, or feature requests  
+        - ACCOUNT_MANAGEMENT: Account settings, password resets, profile changes
+        - GENERAL_INQUIRY: General questions about products or services
+        - COMPLAINT: Complaints or negative feedback
+        - COMPLIMENT: Positive feedback or praise
+        
+        Respond with the intent category and a confidence score (0-1).
+      tools:
+        - type: http
+          name: customer_db
+          url: "https://api.example.com/customers"
+          auth:
+            type: bearer
+            token: "${CUSTOMER_DB_TOKEN}"
+        - type: mcp
+          name: knowledge_base
+          server: "knowledge-base-mcp-server"
+      resources:
+        memory_limit: 256Mi
+        timeout: 30s
+      scaling:
+        min_instances: 1
+        max_instances: 3
+      environment:
+        LOG_LEVEL: info
+        
+    - name: response-generator
+      provider: openai
+      model: gpt-4o
+      system_prompt: |
+        You are a helpful customer support agent. Generate empathetic, professional responses to customer inquiries.
+        
+        Guidelines:
+        - Always be polite and understanding
+        - Provide clear, actionable solutions
+        - If you don't know something, direct them to appropriate resources
+        - Match the tone of the customer's message
+        - Keep responses concise but complete
+      depends_on: [intent-classifier]
+      tools:
+        - type: websocket
+          name: live_chat
+          endpoint: "wss://chat.example.com/agent"
+          auth:
+            type: api_key
+            api_key: "${CHAT_API_KEY}"
+        - type: http
+          name: ticket_system
+          url: "https://tickets.example.com/api"
+          auth:
+            type: basic
+            api_key: "${TICKET_USER}"
+            secret: "${TICKET_PASS}"
+      resources:
+        memory_limit: 512Mi
+        timeout: 60s
+      scaling:
+        min_instances: 0
+        max_instances: 5
+      environment:
+        RESPONSE_STYLE: professional
+        MAX_RESPONSE_LENGTH: "500"

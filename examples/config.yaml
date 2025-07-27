@@ -1,0 +1,50 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  timeout: 30s
+  log_level: info
+  metrics:
+    enabled: true
+    path: /metrics
+    port: 9090
+
+providers:
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    base_url: "https://api.anthropic.com"
+    version: "2023-06-01"
+    timeout: 60s
+    
+  openai:
+    api_key: "${OPENAI_API_KEY}"
+    base_url: "https://api.openai.com"
+    org_id: "${OPENAI_ORG_ID}"
+    timeout: 60s
+    
+  gemini:
+    api_key: "${GOOGLE_API_KEY}"
+    project_id: "${GOOGLE_PROJECT_ID}"
+    timeout: 60s
+
+clusters:
+  - apiVersion: goagents.dev/v1
+    kind: AgentCluster
+    metadata:
+      name: example-cluster
+      namespace: default
+    spec:
+      resource_policy:
+        max_concurrent_agents: 2
+        idle_timeout: 300s
+        scale_to_zero: true
+      agents:
+        - name: simple-assistant
+          provider: anthropic
+          model: claude-sonnet-4
+          system_prompt: "You are a helpful AI assistant."
+          resources:
+            memory_limit: 256Mi
+            timeout: 30s
+          scaling:
+            min_instances: 0
+            max_instances: 1

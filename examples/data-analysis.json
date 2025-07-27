@@ -1,0 +1,85 @@
+{
+  "apiVersion": "goagents.dev/v1",
+  "kind": "AgentCluster",
+  "metadata": {
+    "name": "data-analysis",
+    "namespace": "analytics",
+    "labels": {
+      "team": "data-science",
+      "environment": "development"
+    }
+  },
+  "spec": {
+    "resource_policy": {
+      "max_concurrent_agents": 3,
+      "idle_timeout": "600s",
+      "scale_to_zero": false
+    },
+    "agents": [
+      {
+        "name": "data-processor",
+        "provider": "gemini",
+        "model": "gemini-1.5-pro",
+        "system_prompt": "You are a data processing specialist. Analyze datasets, identify patterns, and generate insights. Focus on statistical analysis, data quality assessment, and trend identification.",
+        "tools": [
+          {
+            "type": "http",
+            "name": "data_warehouse",
+            "url": "https://warehouse.example.com/api/v2",
+            "auth": {
+              "type": "bearer",
+              "token": "${DATA_WAREHOUSE_TOKEN}"
+            }
+          },
+          {
+            "type": "mcp",
+            "name": "pandas_tools",
+            "server": "pandas-mcp-server"
+          }
+        ],
+        "resources": {
+          "memory_limit": "1Gi",
+          "timeout": "120s"
+        },
+        "scaling": {
+          "min_instances": 1,
+          "max_instances": 2
+        },
+        "environment": {
+          "PROCESSING_MODE": "batch",
+          "OUTPUT_FORMAT": "json"
+        }
+      },
+      {
+        "name": "report-generator",
+        "provider": "anthropic",
+        "model": "claude-3-5-sonnet-20241022",
+        "system_prompt": "You are a report generation specialist. Create clear, comprehensive reports from data analysis results. Focus on executive summaries, key findings, and actionable recommendations.",
+        "depends_on": ["data-processor"],
+        "tools": [
+          {
+            "type": "http",
+            "name": "report_service",
+            "url": "https://reports.example.com/api",
+            "auth": {
+              "type": "api_key",
+              "api_key": "${REPORT_API_KEY}"
+            }
+          }
+        ],
+        "resources": {
+          "memory_limit": "512Mi",
+          "timeout": "90s"
+        },
+        "scaling": {
+          "min_instances": 0,
+          "max_instances": 2
+        },
+        "environment": {
+          "REPORT_TEMPLATE": "executive",
+          "INCLUDE_CHARTS": "true"
+        }
+      }
+    ]
+  }
+}
