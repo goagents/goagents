@@ -1,38 +1,39 @@
 package providers
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
-	"time"
+
+	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 )
 
 type OpenAIProvider struct {
 	config *OpenAIConfig
-	client *http.Client
+	client *openai.Client
 }
 
 func NewOpenAIProvider(config *OpenAIConfig) *OpenAIProvider {
-	timeout := 30 * time.Second
-	if config.Timeout > 0 {
-		timeout = config.Timeout
-	}
-	
 	baseURL := "https://api.openai.com"
 	if config.BaseURL != "" {
 		baseURL = config.BaseURL
 	}
 	config.BaseURL = baseURL
 	
+	opts := []option.RequestOption{
+		option.WithAPIKey(config.APIKey),
+	}
+	
+	if config.BaseURL != "" {
+		opts = append(opts, option.WithBaseURL(config.BaseURL))
+	}
+	
+	client := openai.NewClient(opts...)
+	
 	return &OpenAIProvider{
 		config: config,
-		client: &http.Client{
-			Timeout: timeout,
-		},
+		client: &client,
 	}
 }
 
@@ -41,41 +42,14 @@ func (p *OpenAIProvider) Name() string {
 }
 
 func (p *OpenAIProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
-	openaiReq := p.convertRequest(req)
+	params := p.convertToChatCompletionParams(req)
 	
-	reqBody, err := json.Marshal(openaiReq)
+	resp, err := p.client.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, fmt.Errorf("openai API error: %w", err)
 	}
 	
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.config.BaseURL+"/v1/chat/completions", bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.config.APIKey)
-	if p.config.OrgID != "" {
-		httpReq.Header.Set("OpenAI-Organization", p.config.OrgID)
-	}
-	
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
-	}
-	
-	var openaiResp openaiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&openaiResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-	
-	return p.convertResponse(&openaiResp), nil
+	return p.convertFromChatCompletion(resp), nil
 }
 
 func (p *OpenAIProvider) Stream(ctx context.Context, req *ChatRequest) (<-chan *StreamChunk, error) {
@@ -84,57 +58,53 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req *ChatRequest) (<-chan *
 	go func() {
 		defer close(chunks)
 		
-		openaiReq := p.convertRequest(req)
-		openaiReq.Stream = true
+		params := p.convertToChatCompletionParams(req)
 		
-		reqBody, err := json.Marshal(openaiReq)
-		if err != nil {
-			chunks <- &StreamChunk{Error: fmt.Sprintf("failed to marshal request: %v", err)}
-			return
-		}
+		stream := p.client.Chat.Completions.NewStreaming(ctx, params)
 		
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", p.config.BaseURL+"/v1/chat/completions", bytes.NewReader(reqBody))
-		if err != nil {
-			chunks <- &StreamChunk{Error: fmt.Sprintf("failed to create request: %v", err)}
-			return
-		}
+		var fullContent strings.Builder
+		chunkIndex := 0
+		acc := openai.ChatCompletionAccumulator{}
 		
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+p.config.APIKey)
-		httpReq.Header.Set("Accept", "text/event-stream")
-		if p.config.OrgID != "" {
-			httpReq.Header.Set("OpenAI-Organization", p.config.OrgID)
-		}
-		
-		resp, err := p.client.Do(httpReq)
-		if err != nil {
-			chunks <- &StreamChunk{Error: fmt.Sprintf("request failed: %v", err)}
-			return
-		}
-		defer resp.Body.Close()
-		
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			chunks <- &StreamChunk{Error: fmt.Sprintf("API error %d: %s", resp.StatusCode, string(body))}
-			return
-		}
-		
-		// For demo purposes, simulate streaming response
-		content := "This is a simulated streaming response from GPT-4"
-		words := strings.Split(content, " ")
-		
-		for i, word := range words {
-			select {
-			case <-ctx.Done():
-				return
-			case chunks <- &StreamChunk{
-				ID:      fmt.Sprintf("chunk-%d", i),
-				Delta:   word + " ",
-				Content: strings.Join(words[:i+1], " "),
-				Done:    i == len(words)-1,
-			}:
-				time.Sleep(100 * time.Millisecond)
+		for stream.Next() {
+			chunk := stream.Current()
+			acc.AddChunk(chunk)
+			
+			if len(chunk.Choices) > 0 {
+				delta := chunk.Choices[0].Delta.Content
+				if delta != "" {
+					fullContent.WriteString(delta)
+					
+					select {
+					case <-ctx.Done():
+						return
+					case chunks <- &StreamChunk{
+						ID:      chunk.ID,
+						Delta:   delta,
+						Content: fullContent.String(),
+						Done:    false,
+					}:
+						chunkIndex++
+					}
+				}
 			}
+		}
+		
+		if err := stream.Err(); err != nil {
+			chunks <- &StreamChunk{Error: fmt.Sprintf("streaming error: %v", err)}
+			return
+		}
+		
+		// Send final chunk
+		select {
+		case <-ctx.Done():
+			return
+		case chunks <- &StreamChunk{
+			ID:      fmt.Sprintf("final_chunk_%d", chunkIndex),
+			Delta:   "",
+			Content: fullContent.String(),
+			Done:    true,
+		}:
 		}
 	}()
 	
@@ -155,120 +125,71 @@ func (p *OpenAIProvider) Close() error {
 	return nil
 }
 
-type openaiRequest struct {
-	Model       string           `json:"model"`
-	Messages    []openaiMessage  `json:"messages"`
-	MaxTokens   int              `json:"max_tokens,omitempty"`
-	Temperature float64          `json:"temperature,omitempty"`
-	TopP        float64          `json:"top_p,omitempty"`
-	Tools       []openaiTool     `json:"tools,omitempty"`
-	Stream      bool             `json:"stream,omitempty"`
-}
-
-type openaiMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type openaiTool struct {
-	Type     string                 `json:"type"`
-	Function openaiToolFunction     `json:"function"`
-}
-
-type openaiToolFunction struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Parameters  map[string]interface{} `json:"parameters"`
-}
-
-type openaiResponse struct {
-	ID      string               `json:"id"`
-	Object  string               `json:"object"`
-	Created int64                `json:"created"`
-	Model   string               `json:"model"`
-	Choices []openaiChoice       `json:"choices"`
-	Usage   openaiUsage          `json:"usage"`
-}
-
-type openaiChoice struct {
-	Index        int                   `json:"index"`
-	Message      openaiMessage         `json:"message"`
-	FinishReason string                `json:"finish_reason"`
-	ToolCalls    []openaiToolCall      `json:"tool_calls,omitempty"`
-}
-
-type openaiToolCall struct {
-	ID       string                `json:"id"`
-	Type     string                `json:"type"`
-	Function openaiToolCallFunction `json:"function"`
-}
-
-type openaiToolCallFunction struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-}
-
-type openaiUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
-
-func (p *OpenAIProvider) convertRequest(req *ChatRequest) *openaiRequest {
-	openaiReq := &openaiRequest{
-		Model:       req.Model,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Stream:      req.Stream,
+func (p *OpenAIProvider) convertToChatCompletionParams(req *ChatRequest) openai.ChatCompletionNewParams {
+	params := openai.ChatCompletionNewParams{
+		Model: req.Model,
+	}
+	
+	if req.MaxTokens > 0 {
+		params.MaxTokens = openai.Int(int64(req.MaxTokens))
+	}
+	
+	if req.Temperature > 0 {
+		params.Temperature = openai.Float(req.Temperature)
+	}
+	
+	if req.TopP > 0 {
+		params.TopP = openai.Float(req.TopP)
 	}
 	
 	// Convert messages
+	messages := []openai.ChatCompletionMessageParamUnion{}
 	for _, msg := range req.Messages {
-		openaiReq.Messages = append(openaiReq.Messages, openaiMessage{
-			Role:    msg.Role,
-			Content: msg.Content,
-		})
+		switch msg.Role {
+		case "system":
+			messages = append(messages, openai.SystemMessage(msg.Content))
+		case "user":
+			messages = append(messages, openai.UserMessage(msg.Content))
+		case "assistant":
+			messages = append(messages, openai.AssistantMessage(msg.Content))
+		}
 	}
+	params.Messages = messages
 	
-	// Convert tools
-	for _, tool := range req.Tools {
-		openaiReq.Tools = append(openaiReq.Tools, openaiTool{
-			Type: "function",
-			Function: openaiToolFunction{
-				Name:        tool.Name,
-				Description: tool.Description,
-				Parameters:  tool.Parameters,
-			},
-		})
-	}
+	// Convert tools - skip for now to get basic functionality working
 	
-	return openaiReq
+	return params
 }
 
-func (p *OpenAIProvider) convertResponse(resp *openaiResponse) *ChatResponse {
+func (p *OpenAIProvider) convertFromChatCompletion(resp *openai.ChatCompletion) *ChatResponse {
 	chatResp := &ChatResponse{
 		ID:    resp.ID,
 		Model: resp.Model,
-		Usage: &Usage{
-			PromptTokens:     resp.Usage.PromptTokens,
-			CompletionTokens: resp.Usage.CompletionTokens,
-			TotalTokens:      resp.Usage.TotalTokens,
-		},
+	}
+	
+	if resp.Usage.PromptTokens > 0 {
+		chatResp.Usage = &Usage{
+			PromptTokens:     int(resp.Usage.PromptTokens),
+			CompletionTokens: int(resp.Usage.CompletionTokens),
+			TotalTokens:      int(resp.Usage.TotalTokens),
+		}
 	}
 	
 	if len(resp.Choices) > 0 {
 		choice := resp.Choices[0]
-		chatResp.Content = choice.Message.Content
+		if choice.Message.Content != "" {
+			chatResp.Content = choice.Message.Content
+		}
 		
 		// Convert tool calls
-		for _, toolCall := range choice.ToolCalls {
-			var args map[string]interface{}
-			if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err == nil {
+		for _, toolCall := range choice.Message.ToolCalls {
+			if toolCall.Function.Name != "" {
 				chatResp.ToolUse = append(chatResp.ToolUse, ToolUse{
 					ID:   toolCall.ID,
 					Name: toolCall.Function.Name,
-					Args: args,
+					Args: map[string]interface{}{
+						"arguments": toolCall.Function.Arguments,
+					},
 				})
 			}
 		}

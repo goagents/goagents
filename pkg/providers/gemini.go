@@ -1,32 +1,33 @@
 package providers
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
-	"time"
+
+	"github.com/google/generative-ai-go/genai"
+	"google.golang.org/api/option"
 )
 
 type GeminiProvider struct {
 	config *GeminiConfig
-	client *http.Client
+	client *genai.Client
 }
 
 func NewGeminiProvider(config *GeminiConfig) *GeminiProvider {
-	timeout := 30 * time.Second
-	if config.Timeout > 0 {
-		timeout = config.Timeout
+	ctx := context.Background()
+	client, err := genai.NewClient(ctx, option.WithAPIKey(config.APIKey))
+	if err != nil {
+		// For now, return a provider with nil client - errors will be handled in methods
+		return &GeminiProvider{
+			config: config,
+			client: nil,
+		}
 	}
 	
 	return &GeminiProvider{
 		config: config,
-		client: &http.Client{
-			Timeout: timeout,
-		},
+		client: client,
 	}
 }
 
@@ -35,40 +36,35 @@ func (p *GeminiProvider) Name() string {
 }
 
 func (p *GeminiProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
-	geminiReq := p.convertRequest(req)
+	if p.client == nil {
+		return nil, fmt.Errorf("gemini client not initialized")
+	}
 	
-	reqBody, err := json.Marshal(geminiReq)
+	model := p.client.GenerativeModel(req.Model)
+	
+	// Configure generation settings
+	if req.Temperature > 0 {
+		temp := float32(req.Temperature)
+		model.Temperature = &temp
+	}
+	if req.TopP > 0 {
+		topP := float32(req.TopP)
+		model.TopP = &topP
+	}
+	if req.MaxTokens > 0 {
+		maxTokens := int32(req.MaxTokens)
+		model.MaxOutputTokens = &maxTokens
+	}
+	
+	// Convert messages to parts
+	parts := p.convertMessagesToParts(req.Messages)
+	
+	resp, err := model.GenerateContent(ctx, parts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, fmt.Errorf("gemini API error: %w", err)
 	}
 	
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", 
-		req.Model, p.config.APIKey)
-	
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	
-	httpReq.Header.Set("Content-Type", "application/json")
-	
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
-	}
-	
-	var geminiResp geminiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-	
-	return p.convertResponse(&geminiResp, req.Model), nil
+	return p.convertFromGeminiResponse(resp, req.Model), nil
 }
 
 func (p *GeminiProvider) Stream(ctx context.Context, req *ChatRequest) (<-chan *StreamChunk, error) {
@@ -77,22 +73,79 @@ func (p *GeminiProvider) Stream(ctx context.Context, req *ChatRequest) (<-chan *
 	go func() {
 		defer close(chunks)
 		
-		// For demo purposes, simulate streaming response
-		content := "This is a simulated streaming response from Gemini"
-		words := strings.Split(content, " ")
+		if p.client == nil {
+			chunks <- &StreamChunk{Error: "gemini client not initialized"}
+			return
+		}
 		
-		for i, word := range words {
-			select {
-			case <-ctx.Done():
+		model := p.client.GenerativeModel(req.Model)
+		
+		// Configure generation settings
+		if req.Temperature > 0 {
+			temp := float32(req.Temperature)
+			model.Temperature = &temp
+		}
+		if req.TopP > 0 {
+			topP := float32(req.TopP)
+			model.TopP = &topP
+		}
+		if req.MaxTokens > 0 {
+			maxTokens := int32(req.MaxTokens)
+			model.MaxOutputTokens = &maxTokens
+		}
+		
+		// Convert messages to parts
+		parts := p.convertMessagesToParts(req.Messages)
+		
+		iter := model.GenerateContentStream(ctx, parts...)
+		
+		var fullContent strings.Builder
+		chunkIndex := 0
+		
+		for {
+			resp, err := iter.Next()
+			if err != nil {
+				if err.Error() == "iterator done" {
+					break
+				}
+				chunks <- &StreamChunk{Error: fmt.Sprintf("streaming error: %v", err)}
 				return
-			case chunks <- &StreamChunk{
-				ID:      fmt.Sprintf("chunk-%d", i),
-				Delta:   word + " ",
-				Content: strings.Join(words[:i+1], " "),
-				Done:    i == len(words)-1,
-			}:
-				time.Sleep(100 * time.Millisecond)
 			}
+			
+			for _, candidate := range resp.Candidates {
+				if candidate.Content != nil {
+					for _, part := range candidate.Content.Parts {
+						if textPart, ok := part.(genai.Text); ok {
+							text := string(textPart)
+							fullContent.WriteString(text)
+							
+							select {
+							case <-ctx.Done():
+								return
+							case chunks <- &StreamChunk{
+								ID:      fmt.Sprintf("chunk_%d", chunkIndex),
+								Delta:   text,
+								Content: fullContent.String(),
+								Done:    false,
+							}:
+								chunkIndex++
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		// Send final chunk
+		select {
+		case <-ctx.Done():
+			return
+		case chunks <- &StreamChunk{
+			ID:      fmt.Sprintf("final_chunk_%d", chunkIndex),
+			Delta:   "",
+			Content: fullContent.String(),
+			Done:    true,
+		}:
 		}
 	}()
 	
@@ -108,116 +161,56 @@ func (p *GeminiProvider) Models() []string {
 }
 
 func (p *GeminiProvider) Close() error {
+	if p.client != nil {
+		return p.client.Close()
+	}
 	return nil
 }
 
-type geminiRequest struct {
-	Contents         []geminiContent          `json:"contents"`
-	Tools            []geminiTool             `json:"tools,omitempty"`
-	GenerationConfig *geminiGenerationConfig  `json:"generationConfig,omitempty"`
-}
-
-type geminiContent struct {
-	Role  string         `json:"role"`
-	Parts []geminiPart   `json:"parts"`
-}
-
-type geminiPart struct {
-	Text string `json:"text"`
-}
-
-type geminiTool struct {
-	FunctionDeclarations []geminiFunctionDeclaration `json:"functionDeclarations"`
-}
-
-type geminiFunctionDeclaration struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Parameters  map[string]interface{} `json:"parameters"`
-}
-
-type geminiGenerationConfig struct {
-	Temperature   float64 `json:"temperature,omitempty"`
-	TopP          float64 `json:"topP,omitempty"`
-	MaxOutputTokens int   `json:"maxOutputTokens,omitempty"`
-}
-
-type geminiResponse struct {
-	Candidates     []geminiCandidate     `json:"candidates"`
-	UsageMetadata  *geminiUsageMetadata  `json:"usageMetadata,omitempty"`
-}
-
-type geminiCandidate struct {
-	Content       geminiContent `json:"content"`
-	FinishReason  string        `json:"finishReason"`
-	Index         int           `json:"index"`
-}
-
-type geminiUsageMetadata struct {
-	PromptTokenCount     int `json:"promptTokenCount"`
-	CandidatesTokenCount int `json:"candidatesTokenCount"`
-	TotalTokenCount      int `json:"totalTokenCount"`
-}
-
-func (p *GeminiProvider) convertRequest(req *ChatRequest) *geminiRequest {
-	geminiReq := &geminiRequest{
-		GenerationConfig: &geminiGenerationConfig{
-			Temperature:     req.Temperature,
-			TopP:            req.TopP,
-			MaxOutputTokens: req.MaxTokens,
-		},
-	}
+func (p *GeminiProvider) convertMessagesToParts(messages []Message) []genai.Part {
+	var parts []genai.Part
 	
-	// Convert messages
-	for _, msg := range req.Messages {
-		role := msg.Role
-		if role == "assistant" {
-			role = "model"
-		}
-		
-		geminiReq.Contents = append(geminiReq.Contents, geminiContent{
-			Role: role,
-			Parts: []geminiPart{
-				{Text: msg.Content},
-			},
-		})
-	}
-	
-	// Convert tools
-	if len(req.Tools) > 0 {
-		var declarations []geminiFunctionDeclaration
-		for _, tool := range req.Tools {
-			declarations = append(declarations, geminiFunctionDeclaration{
-				Name:        tool.Name,
-				Description: tool.Description,
-				Parameters:  tool.Parameters,
-			})
-		}
-		geminiReq.Tools = []geminiTool{
-			{FunctionDeclarations: declarations},
+	for _, msg := range messages {
+		// For now, simply concatenate all messages as text parts
+		// The Gemini API handles conversation differently than chat completions
+		if msg.Role == "system" {
+			parts = append(parts, genai.Text(fmt.Sprintf("System: %s", msg.Content)))
+		} else if msg.Role == "user" {
+			parts = append(parts, genai.Text(msg.Content))
+		} else if msg.Role == "assistant" {
+			parts = append(parts, genai.Text(fmt.Sprintf("Assistant: %s", msg.Content)))
 		}
 	}
 	
-	return geminiReq
+	return parts
 }
 
-func (p *GeminiProvider) convertResponse(resp *geminiResponse, model string) *ChatResponse {
+func (p *GeminiProvider) convertFromGeminiResponse(resp *genai.GenerateContentResponse, model string) *ChatResponse {
 	chatResp := &ChatResponse{
-		ID:    fmt.Sprintf("gemini-%d", time.Now().UnixNano()),
+		ID:    fmt.Sprintf("gemini-%d", resp.UsageMetadata.TotalTokenCount),
 		Model: model,
 	}
 	
 	if resp.UsageMetadata != nil {
 		chatResp.Usage = &Usage{
-			PromptTokens:     resp.UsageMetadata.PromptTokenCount,
-			CompletionTokens: resp.UsageMetadata.CandidatesTokenCount,
-			TotalTokens:      resp.UsageMetadata.TotalTokenCount,
+			PromptTokens:     int(resp.UsageMetadata.PromptTokenCount),
+			CompletionTokens: int(resp.UsageMetadata.CandidatesTokenCount),
+			TotalTokens:      int(resp.UsageMetadata.TotalTokenCount),
 		}
 	}
 	
-	if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
-		chatResp.Content = resp.Candidates[0].Content.Parts[0].Text
+	// Extract content from candidates
+	var content strings.Builder
+	for _, candidate := range resp.Candidates {
+		if candidate.Content != nil {
+			for _, part := range candidate.Content.Parts {
+				if textPart, ok := part.(genai.Text); ok {
+					content.WriteString(string(textPart))
+				}
+			}
+		}
 	}
+	chatResp.Content = content.String()
 	
 	return chatResp
 }
